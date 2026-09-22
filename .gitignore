@@ -1,0 +1,13 @@
+# fora do site publicado: ferramenta de validacao, screenshots e notas internas
+_tool/
+_preview/
+LEIA-ME.md
+
+# minimo de seguranca
+.env
+.env.*
+*.local
+secrets/
+credentials.json
+*.kdbx
+.claude/settings.local.json

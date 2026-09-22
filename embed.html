@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<!--
+  PLAYER EMBED (carregado por iframe): video HLS da Bunny Stream com "smart autoplay" estilo vTurb.
+  Uso: embed.html?v=<guid do video na Bunny>. Snippet pra colar e trava por dominio: LEIA-ME.md.
+  Mesmo comportamento do player da pagina\index.html: toca mudo com aviso piscando; 1o toque volta
+  pro 0:00 com som; depois cada toque pausa/continua; sem barra de seek.
+-->
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>Video</title>
+<style>
+  *,*::before,*::after{box-sizing:border-box}
+  html,body{margin:0;height:100%;background:#000;overflow:hidden}
+  body{font-family:"Segoe UI",system-ui,-apple-system,Roboto,sans-serif;-webkit-text-size-adjust:100%;text-size-adjust:100%}
+
+  /* caixa = iframe inteiro: toque em qualquer ponto conta */
+  .box{position:relative;width:100%;height:100%;cursor:pointer;touch-action:manipulation;-webkit-tap-highlight-color:transparent;-webkit-user-select:none;user-select:none}
+  .box.off{cursor:default}
+  .box video{position:absolute;top:0;left:0;width:100%;height:100%;object-fit:contain;background:#000}
+
+  /* aviso "video tocando mudo": caixa amarela centralizada, some no 1o toque.
+     Tamanhos em vw (= largura do iframe) com clamp(): legivel de 280 a 420 px */
+  .vsl-notice,.vsl-play{appearance:none;-webkit-appearance:none;margin:0;padding:0;border:0}
+  .vsl-notice{
+    position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);z-index:2;
+    display:flex;flex-direction:column;align-items:center;gap:clamp(6px,2.6vw,10px);
+    width:80%;max-width:300px;padding:clamp(12px,5vw,22px) clamp(10px,4.5vw,20px);
+    background:#FFCC00;border:3px solid #000;border-radius:clamp(10px,4vw,14px);
+    font-family:inherit;cursor:pointer;
+  }
+  .vsl-notice-icon{width:clamp(24px,9.5vw,38px);height:clamp(24px,9.5vw,38px)}
+  .vsl-notice-text{margin:0;color:#000;font-weight:800;text-transform:uppercase;text-align:center;font-size:clamp(14px,5.2vw,21px);line-height:1.3}
+  .vsl-notice-sub{display:block;margin-top:clamp(4px,1.6vw,6px);font-size:clamp(12px,4vw,16px);font-weight:700}
+  /* pisca enquanto o video roda mudo: caixa pulsa, icone do alto-falante acende/apaga */
+  .vsl-notice{animation:vsl-pulse 1s ease-in-out infinite}
+  .vsl-notice-icon{animation:vsl-blink 1s steps(1) infinite}
+  @keyframes vsl-pulse{0%,100%{transform:translate(-50%,-50%) scale(1)}50%{transform:translate(-50%,-50%) scale(1.08)}}
+  @keyframes vsl-blink{50%{opacity:0}}
+
+  /* botao de play grande: so aparece quando o usuario pausa (depois do desbloqueio do audio) */
+  .vsl-play{
+    position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);z-index:2;
+    width:clamp(56px,20vw,84px);height:clamp(56px,20vw,84px);border-radius:50%;
+    background:rgba(0,0,0,.55);border:3px solid #FFFFFF;
+    display:flex;align-items:center;justify-content:center;cursor:pointer;
+  }
+  .vsl-play svg{width:40%;height:40%}
+  .vsl-notice[hidden],.vsl-play[hidden],.erro[hidden]{display:none}
+
+  /* guid invalido/ausente */
+  .erro{position:absolute;top:50%;left:0;right:0;transform:translateY(-50%);margin:0;padding:0 16px;color:#BBBBBB;text-align:center;font-size:clamp(14px,4.5vw,18px);line-height:1.4}
+</style>
+</head>
+<body>
+
+<div class="box" id="vsl-box">
+  <video id="vsl-video" muted autoplay playsinline webkit-playsinline preload="auto"></video>
+
+  <button type="button" id="vsl-notice" class="vsl-notice" aria-label="Tocca per attivare l'audio" hidden>
+    <svg class="vsl-notice-icon" viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M11 5 6 9H2v6h4l5 4V5z" fill="#000"></path>
+      <line x1="23" y1="9" x2="17" y2="15" stroke="#D81E1E" stroke-width="2.6" stroke-linecap="round"></line>
+      <line x1="17" y1="9" x2="23" y2="15" stroke="#D81E1E" stroke-width="2.6" stroke-linecap="round"></line>
+    </svg>
+    <span class="vsl-notice-text">IL TUO VIDEO È INIZIATO!<span class="vsl-notice-sub">TOCCA QUI PER ASCOLTARE!</span></span>
+  </button>
+
+  <button type="button" id="vsl-play" class="vsl-play" aria-label="Riprendi il video" hidden>
+    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5v14l11-7z" fill="#fff"></path></svg>
+  </button>
+
+  <p id="vsl-erro" class="erro" hidden>Video non disponibile</p>
+</div>
+
+<script>
+(function () {
+  'use strict';
+  var CDN = 'https://vz-6935c328-5a0.b-cdn.net/'; // biblioteca Bunny Stream
+  var HLSJS_SRC = 'https://cdn.jsdelivr.net/npm/hls.js@1.7.3/dist/hls.min.js'; // versao fixa, nao "latest"
+  var UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+  var box = document.getElementById('vsl-box');
+  var video = document.getElementById('vsl-video');
+  var notice = document.getElementById('vsl-notice');
+  var playBtn = document.getElementById('vsl-play');
+  var erro = document.getElementById('vsl-erro');
+
+  // guid vem de ?v= ; formato invalido = mensagem neutra e nada carrega
+  var m = /[?&]v=([^&#]*)/.exec(location.search);
+  var guid = m ? m[1] : '';
+  if (!UUID.test(guid)) {
+    video.removeAttribute('autoplay');
+    box.className += ' off';
+    erro.hidden = false;
+    return;
+  }
+  guid = guid.toLowerCase();
+  var HLS_URL = CDN + guid + '/playlist.m3u8';
+  video.poster = CDN + guid + '/thumbnail.jpg';
+  notice.hidden = false;
+
+  var unlocked = false; // true depois do 1o toque (audio liberado)
+
+  function tentaTocar(comAudio) {
+    video.muted = !comAudio;
+    var p = video.play();
+    if (p && typeof p.catch === 'function') {
+      p.catch(function () { /* autoplay bloqueado (economia de bateria/dados): fica no poster com o aviso */ });
+    }
+  }
+
+  // HLS nativo no Safari/iOS; hls.js nos demais (so carrega se precisar)
+  function iniciaHls() {
+    if (video.canPlayType('application/vnd.apple.mpegurl')) {
+      video.src = HLS_URL;
+      tentaTocar(unlocked);
+      return;
+    }
+    var script = document.createElement('script');
+    script.src = HLSJS_SRC;
+    script.onload = function () {
+      if (window.Hls && window.Hls.isSupported()) {
+        var hls = new window.Hls();
+        hls.loadSource(HLS_URL);
+        hls.attachMedia(video);
+        // se o toque chegou antes do manifest, aqui ja recomeca com o audio certo
+        hls.on(window.Hls.Events.MANIFEST_PARSED, function () { tentaTocar(unlocked); });
+      }
+    };
+    document.head.appendChild(script);
+  }
+
+  // toque em qualquer ponto (video, aviso ou play)
+  box.addEventListener('click', function () {
+    if (!unlocked) {
+      unlocked = true;
+      notice.hidden = true;
+      try { video.currentTime = 0; } catch (e) { /* metadados ainda nao carregados: ignora */ }
+      tentaTocar(true);
+      return;
+    }
+    if (video.paused) { playBtn.hidden = true; tentaTocar(true); }
+    else { video.pause(); playBtn.hidden = false; }
+  });
+
+  iniciaHls();
+})();
+</script>
+
+</body>
+</html>
