@@ -103,31 +103,95 @@
   notice.hidden = false;
 
   var unlocked = false; // true depois do 1o toque (audio liberado)
+  var hls = null; // instancia ativa do hls.js; null quando usa HLS nativo (Safari/iOS)
+  var pendingPlay = null; // promise do play() em curso
+  var busy = false; // trava toque duplo/rajada (double-tap) enquanto o anterior ainda esta em voo
+  var pausedByUs = false; // pausamos nos (aba em 2o plano), nao o usuario: so esse caso retoma sozinho
+  var tentativasRecovery = 0; // limite pra recuperacao de erro nao martelar pra sempre
 
   function tentaTocar(comAudio) {
     video.muted = !comAudio;
     var p = video.play();
-    if (p && typeof p.catch === 'function') {
-      p.catch(function () { /* autoplay bloqueado (economia de bateria/dados): fica no poster com o aviso */ });
+    pendingPlay = (p && typeof p.catch === 'function')
+      ? p.catch(function () { /* autoplay bloqueado (economia de bateria/dados): fica no poster com o aviso */ })
+      : null;
+    return pendingPlay || Promise.resolve();
+  }
+
+  // nunca chama pause() com um play() ainda em voo: essa sobreposicao e a causa classica (Chrome/MSE
+  // e Safari/AVPlayer) do video travar num frame congelado enquanto o audio continua tocando sozinho
+  function pausaSegura() {
+    var espera = pendingPlay || Promise.resolve();
+    return espera.then(function () { try { video.pause(); } catch (e) {} }, function () { try { video.pause(); } catch (e) {} });
+  }
+
+  // recuperacao de erro: sem isso, qualquer solavanco de rede ou decode vira travamento permanente
+  // (o player nunca tinha handler nenhum de erro antes desta correcao)
+  function recuperar() {
+    if (tentativasRecovery >= 3) return; // desiste depois de 3 tentativas: nao martela pra sempre
+    tentativasRecovery++;
+    var ct = video.currentTime || 0;
+    var tocando = !video.paused;
+    if (hls) {
+      try { hls.recoverMediaError ? hls.recoverMediaError() : hls.startLoad(); } catch (e) {}
+    } else {
+      // nativo: currentTime so pode ser aplicado DEPOIS do loadedmetadata (setar antes e ignorado/
+      // zerado pelo navegador) -- aplicar direto feito na 1a versao desta correcao voltava o video pro 0
+      try {
+        video.addEventListener('loadedmetadata', function aoCarregar() {
+          video.removeEventListener('loadedmetadata', aoCarregar);
+          try { video.currentTime = ct; } catch (e) {}
+          if (tocando) tentaTocar(!video.muted);
+        });
+        video.src = HLS_URL;
+        video.load();
+      } catch (e) {}
     }
   }
 
-  // HLS nativo no Safari/iOS; hls.js nos demais (so carrega se precisar)
+  // deteccao igual ao vsl/player.html (mesma base de codigo, ja testada): iOS/iPadOS e Safari de
+  // verdade usam o HLS nativo (AVFoundation); todo o resto tenta hls.js (MSE) primeiro. Importante:
+  // canPlayType('application/vnd.apple.mpegurl') hoje responde truthy tambem em Chrome/Chromium
+  // (desktop recente e Android ha varias versoes) -- usar canPlayType como 1o criterio jogava esses
+  // navegadores pro decoder nativo do Chrome em vez do hls.js, e o nativo do Chrome e o suspeito
+  // mais provavel do "pausa e trava com audio fantasma" (pipeline HLS nativo dele e bem menos
+  // maduro que MSE+hls.js). canPlayType so entra como ULTIMO recurso, se nem hls.js estiver disponivel.
+  var ua = navigator.userAgent || '';
+  var isIOS = /iPad|iPhone|iPod/.test(ua) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+  var isSafari = /^((?!chrome|crios|fxios|android|edg).)*safari/i.test(ua);
+  window.__vslBranch = null; // exposto so pra teste/medicao (headless); nao afeta produto
+
+  function tocaNativo(ramo) {
+    window.__vslBranch = ramo;
+    video.src = HLS_URL;
+    video.addEventListener('error', recuperar);
+    tentaTocar(unlocked);
+  }
+
   function iniciaHls() {
-    if (video.canPlayType('application/vnd.apple.mpegurl')) {
-      video.src = HLS_URL;
-      tentaTocar(unlocked);
-      return;
-    }
+    if (isIOS || isSafari) { tocaNativo('native-ios-safari'); return; }
     var script = document.createElement('script');
     script.src = HLSJS_SRC;
+    // CDN do hls.js fora do ar/bloqueado: cai no nativo em vez de deixar a VSL em branco
+    script.onerror = function () {
+      if (video.canPlayType('application/vnd.apple.mpegurl')) tocaNativo('native-cdn-fail');
+    };
     script.onload = function () {
       if (window.Hls && window.Hls.isSupported()) {
-        var hls = new window.Hls();
+        window.__vslBranch = 'hlsjs';
+        hls = new window.Hls();
         hls.loadSource(HLS_URL);
         hls.attachMedia(video);
         // se o toque chegou antes do manifest, aqui ja recomeca com o audio certo
         hls.on(window.Hls.Events.MANIFEST_PARSED, function () { tentaTocar(unlocked); });
+        hls.on(window.Hls.Events.ERROR, function (event, data) {
+          if (!data || !data.fatal) return;
+          if (data.type === window.Hls.ErrorTypes.NETWORK_ERROR) { try { hls.startLoad(); } catch (e) {} }
+          else recuperar();
+        });
+      } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+        // ultimo recurso: nem MSE/hls.js disponivel, mas o navegador alega suporte nativo
+        tocaNativo('native-fallback');
       }
     };
     document.head.appendChild(script);
@@ -135,6 +199,9 @@
 
   // toque em qualquer ponto (video, aviso ou play)
   box.addEventListener('click', function () {
+    if (busy) return; // ignora toque duplo/rajada em cima do anterior ainda sendo processado
+    busy = true;
+    setTimeout(function () { busy = false; }, 250);
     if (!unlocked) {
       unlocked = true;
       notice.hidden = true;
@@ -142,8 +209,25 @@
       tentaTocar(true);
       return;
     }
-    if (video.paused) { playBtn.hidden = true; tentaTocar(true); }
-    else { video.pause(); playBtn.hidden = false; }
+    if (video.paused) { playBtn.hidden = true; pausedByUs = false; tentaTocar(true); }
+    else { pausaSegura(); playBtn.hidden = false; }
+  });
+
+  // aba/app em 2o plano: pausa de verdade e libera banda (stopLoad); so retoma sozinho se quem
+  // pausou fomos nos (nunca sobrescreve uma pausa manual do usuario)
+  document.addEventListener('visibilitychange', function () {
+    if (document.hidden) {
+      if (!video.paused) { pausedByUs = true; pausaSegura(); if (hls) { try { hls.stopLoad(); } catch (e) {} } }
+    } else if (pausedByUs) {
+      pausedByUs = false;
+      if (hls) { try { hls.startLoad(); } catch (e) {} }
+      tentaTocar(!video.muted);
+    }
+  });
+  // saindo da pagina de vez: libera o hls.js pra nao deixar decoder/segmentos presos em memoria
+  window.addEventListener('pagehide', function () {
+    try { video.pause(); } catch (e) {}
+    if (hls) { try { hls.destroy(); } catch (e) {} }
   });
 
   iniciaHls();
